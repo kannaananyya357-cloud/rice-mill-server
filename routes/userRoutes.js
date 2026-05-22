@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const User = require('../models/User');
 const DeviceToken = require('../models/DeviceToken');
+const UserSettings = require('../models/UserSettings');
 const admin = require('firebase-admin');
 const { verifyToken, requireAdmin } = require('../middleware/auth');
 
@@ -270,6 +271,28 @@ router.post('/:email/share', async (req, res) => {
       owner.sharedWith.push(sharedEmail.toLowerCase());
       await owner.save();
     }
+
+    // Sync settings from owner to shared user
+    try {
+      const ownerSettings = await UserSettings.findOne({ userEmail: owner.email.toLowerCase() });
+      if (ownerSettings) {
+        const updates = {
+          cmdLimit: ownerSettings.cmdLimit,
+          cmdMaxGauge: ownerSettings.cmdMaxGauge,
+          powerLimit: ownerSettings.powerLimit,
+          powerMaxGauge: ownerSettings.powerMaxGauge,
+          pfLimit: ownerSettings.pfLimit
+        };
+        await UserSettings.findOneAndUpdate(
+          { userEmail: sharedUser.email.toLowerCase() },
+          { $set: updates },
+          { upsert: true }
+        );
+      }
+    } catch (syncErr) {
+      console.error('Failed to sync settings limits on admin share:', syncErr);
+    }
+
     const updatedOwner = await getHierarchicalUser(email);
     res.json({ message: 'Access shared successfully', sharedUser, owner: updatedOwner });
   } catch (err) {
@@ -532,12 +555,35 @@ router.post('/share', verifyToken, async (req, res) => {
       const tokens = await DeviceToken.find({ userEmail: emailToShare.toLowerCase() });
       if (tokens && tokens.length > 0) {
         const message = {
+          notification: {
+            title: 'New Device Access Invite',
+            body: `${owner.name || owner.email} wants to share device access with you.`,
+          },
           data: {
             title: 'New Device Access Invite',
             body: `${owner.name || owner.email} wants to share device access with you.`,
-            alertId: 'INVITE'
+            alertId: 'INVITE',
           },
-          tokens: tokens.map(t => t.token)
+          tokens: tokens.map(t => t.token),
+          android: {
+            priority: 'high',
+            notification: {
+              channelId: 'normal_alerts_v1',
+              sound: 'default',
+            }
+          },
+          apns: {
+            payload: {
+              aps: {
+                alert: {
+                  title: 'New Device Access Invite',
+                  body: `${owner.name || owner.email} wants to share device access with you.`,
+                },
+                sound: 'default',
+                badge: 1,
+              },
+            },
+          },
         };
         await admin.messaging().sendEachForMulticast(message);
       }
@@ -584,6 +630,30 @@ router.post('/invitations/accept', verifyToken, async (req, res) => {
     user.pendingInvitations = user.pendingInvitations.filter(i => i.ownerEmail !== ownerEmail);
     
     await user.save();
+
+    // Sync settings from owner to accepting user
+    try {
+      if (invite.ownerEmail) {
+        const ownerSettings = await UserSettings.findOne({ userEmail: invite.ownerEmail.toLowerCase() });
+        if (ownerSettings) {
+          const updates = {
+            cmdLimit: ownerSettings.cmdLimit,
+            cmdMaxGauge: ownerSettings.cmdMaxGauge,
+            powerLimit: ownerSettings.powerLimit,
+            powerMaxGauge: ownerSettings.powerMaxGauge,
+            pfLimit: ownerSettings.pfLimit
+          };
+          await UserSettings.findOneAndUpdate(
+            { userEmail: user.email.toLowerCase() },
+            { $set: updates },
+            { upsert: true }
+          );
+        }
+      }
+    } catch (syncErr) {
+      console.error('Failed to sync settings limits on invitation acceptance:', syncErr);
+    }
+
     res.json({ message: 'Invitation accepted', user });
   } catch (err) {
     res.status(500).json({ error: err.message });

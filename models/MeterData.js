@@ -37,7 +37,11 @@ const meterDataSchema = new mongoose.Schema({
   timestamp: { type: Date, default: Date.now }
 });
 
-// TTL Index to delete data older than 24 hours
-meterDataSchema.index({ timestamp: 1 }, { expireAfterSeconds: 86400 });
+// TTL Index to delete data older than 48 hours (2 days)
+meterDataSchema.index({ timestamp: 1 }, { expireAfterSeconds: 172800 });
+
+// Compound index for query optimization
+meterDataSchema.index({ deviceId: 1, timestamp: -1 });
 
 module.exports = mongoose.model('MeterData', meterDataSchema);
+

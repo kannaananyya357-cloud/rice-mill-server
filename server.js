@@ -7,27 +7,241 @@ const cron = require('node-cron');
 const http = require('http');
 const { Server } = require('socket.io');
 
+// ── In-Memory Cache with TTL ────────────────────────────────────────────────
+class MemCache {
+  constructor(ttlMs = 5 * 60 * 1000) { // default 5 min TTL
+    this._store = new Map();
+    this._ttl = ttlMs;
+  }
+  get(key) {
+    const entry = this._store.get(key);
+    if (!entry) return undefined;
+    if (Date.now() > entry.exp) { this._store.delete(key); return undefined; }
+    return entry.val;
+  }
+  set(key, val, ttlMs) {
+    this._store.set(key, { val, exp: Date.now() + (ttlMs || this._ttl) });
+  }
+  del(key) { this._store.delete(key); }
+  clear() { this._store.clear(); }
+}
+
+const cache = new MemCache(5 * 60 * 1000);       // 5 min for general data
+const hourlyCache = new MemCache(10 * 60 * 1000); // 10 min for hourly timelines
+const histCache = new MemCache(2 * 60 * 1000);    // 2 min for historical-usage (changes with live today)
+
 const MeterData = require('./models/MeterData');
 const DailyUsage = require('./models/DailyUsage');
 const UserSettings = require('./models/UserSettings');
 const Notification = require('./models/Notification');
 const DeviceToken = require('./models/DeviceToken');
 const User = require('./models/User');
+const DeviceAssignment = require('./models/DeviceAssignment');
+const DeviceReset = require('./models/DeviceReset');
 const admin = require('firebase-admin');
 
 // Routes
 const userRoutes = require('./routes/userRoutes');
 const { verifyToken } = require('./middleware/auth');
 
-// Initialize Firebase Admin
+// Initialize Firebase Admin + Firestore
+let db = null;
 try {
   const serviceAccount = require('./service_account_key.json');
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount)
   });
-  console.log('🔥 Firebase Admin initialized');
+  db = admin.firestore();
+  console.log('🔥 Firebase Admin + Firestore initialized');
 } catch (err) {
   console.error('❌ Firebase Admin initialization error:', err.message);
+}
+
+// ── Firestore Sync Helpers ──────────────────────────────────────────────────
+async function syncToFirestore(collection, docId, data) {
+  if (!db) return;
+  try {
+    await db.collection(collection).doc(docId).set(data, { merge: true });
+  } catch (e) {
+    // Non-fatal: log but don't break main flow
+    console.error(`⚠️  Firestore sync error [${collection}]:`, e.message);
+  }
+}
+
+async function addToFirestore(collection, data) {
+  if (!db) return null;
+  try {
+    const ref = await db.collection(collection).add(data);
+    return ref.id;
+  } catch (e) {
+    console.error(`⚠️  Firestore add error [${collection}]:`, e.message);
+    return null;
+  }
+}
+
+async function deleteFromFirestore(collection, docId) {
+  if (!db) return;
+  try {
+    await db.collection(collection).doc(docId).delete();
+  } catch (e) {
+    console.error(`⚠️  Firestore delete error [${collection}]:`, e.message);
+  }
+}
+
+function fsToDate(val) {
+  if (!val) return null;
+  if (typeof val.toDate === 'function') return val.toDate();
+  return new Date(val);
+}
+
+async function compileAndSaveHourlyTimeline(deviceId, dateStr) {
+  if (!db) return null;
+  try {
+    const start = new Date(`${dateStr}T00:00:00+05:30`);
+    const end = new Date(`${dateStr}T23:59:59.999+05:30`);
+
+    const hourlyStats = await MeterData.aggregate([
+      { $match: { deviceId, timestamp: { $gte: start, $lte: end } } },
+      {
+        $group: {
+          _id: { $hour: { date: "$timestamp", timezone: "+05:30" } },
+          avgKVA: { $avg: "$KVA" },
+          maxKVA: { $max: "$KVA" },
+          avgKW: { $avg: "$KW" },
+          maxKW: { $max: "$KW" },
+          avgPF: { $avg: "$PF" },
+          minKWH: { $min: "$KWH" },
+          maxKWH: { $max: "$KWH" }
+        }
+      },
+      { $sort: { "_id": 1 } }
+    ]);
+
+    const statsMap = new Map(hourlyStats.map(h => [h._id, h]));
+    const fullDay = [];
+
+    for (let hour = 0; hour <= 23; hour++) {
+      const h = statsMap.get(hour);
+      let kwh = 0;
+      if (h) {
+        kwh = (h.maxKWH || 0) - (h.minKWH || 0);
+        if (kwh < 0) kwh = h.maxKWH || 0;
+      }
+      fullDay.push({
+        hour: hour,
+        kwh: kwh,
+        avgKVA: h ? (h.avgKVA || 0) : 0,
+        maxKVA: h ? (h.maxKVA || 0) : 0,
+        avgKW: h ? (h.avgKW || 0) : 0,
+        maxKW: h ? (h.maxKW || 0) : 0,
+        avgPF: h ? (h.avgPF || 0) : 0
+      });
+    }
+
+    const docData = {
+      deviceId,
+      date: dateStr,
+      data: fullDay,
+      compiledAt: new Date()
+    };
+
+    await syncToFirestore('hourlyUsage', `${deviceId}_${dateStr}`, docData);
+    console.log(`✅ Pre-compiled hourly usage for ${deviceId} on ${dateStr} saved to Firestore.`);
+    return fullDay;
+  } catch (err) {
+    console.error(`Error compiling hourly usage for ${deviceId} on ${dateStr}:`, err.message);
+    return null;
+  }
+}
+
+async function getDailyUsagesWithSelfHealing(deviceId, start, end) {
+  const localRecords = await DailyUsage.find({
+    deviceId,
+    date: { $gte: start, $lte: end }
+  }).lean();
+
+  const localMap = new Map(localRecords.map(r => [r.date.toISOString().split('T')[0], r]));
+
+  const expectedDates = [];
+  let current = new Date(start);
+  while (current <= end) {
+    expectedDates.push(current.toISOString().split('T')[0]);
+    current.setDate(current.getDate() + 1);
+  }
+
+  const missingDates = expectedDates.filter(dStr => !localMap.has(dStr));
+
+  if (missingDates.length > 0 && db) {
+    console.log(`🔍 [Self-Healing] Missing ${missingDates.length} DailyUsage records in local DB. Querying Firestore in batch...`);
+    try {
+      const refs = missingDates.map(dStr => db.collection('dailyUsage').doc(`${deviceId}_${dStr}`));
+      const docSnaps = await db.getAll(...refs);
+      
+      const bulkOps = [];
+      for (const docSnap of docSnaps) {
+        if (docSnap.exists) {
+          const data = docSnap.data();
+          const dateStr = docSnap.id.split('_')[1];
+          const dailyDoc = {
+            totalKWh: data.totalKWh,
+            maxKVA: data.maxKVA || 0,
+            maxKVATime: fsToDate(data.maxKVATime),
+            minKVA: data.minKVA || 0,
+            minKVATime: fsToDate(data.minKVATime),
+            maxKW: data.maxKW || 0,
+            maxKWTime: fsToDate(data.maxKWTime),
+            minKW: data.minKW || 0,
+            minKWTime: fsToDate(data.minKWTime),
+            avgPF: data.avgPF || 0
+          };
+          const targetDate = new Date(`${dateStr}T00:00:00+05:30`);
+          
+          bulkOps.push({
+            updateOne: {
+              filter: { date: targetDate, deviceId },
+              update: { $set: dailyDoc },
+              upsert: true
+            }
+          });
+          
+          localRecords.push({
+            ...dailyDoc,
+            date: targetDate,
+            deviceId
+          });
+        }
+      }
+      
+      if (bulkOps.length > 0) {
+        await DailyUsage.bulkWrite(bulkOps);
+        console.log(`✅ [Self-Healing] Batch-restored ${bulkOps.length} DailyUsage records from Firestore.`);
+      }
+    } catch (err) {
+      console.error(`⚠️ [Self-Healing] Error batch-restoring from Firestore:`, err.message);
+    }
+  }
+
+  return localRecords;
+}
+
+
+async function clearNotificationsFromFirestore(userEmail) {
+  if (!db) return;
+  try {
+    const snapshot = await db.collection('notificationHistory')
+      .where('userEmail', '==', userEmail.toLowerCase())
+      .get();
+    
+    if (snapshot.empty) return;
+    
+    const batch = db.batch();
+    snapshot.docs.forEach(doc => {
+      batch.delete(doc.ref);
+    });
+    await batch.commit();
+  } catch (e) {
+    console.error('⚠️  Firestore clear notifications error:', e.message);
+  }
 }
 
 const app = express();
@@ -63,10 +277,18 @@ io.on('connection', (socket) => {
   });
 });
 
-// MongoDB Connection
-// Defaulting to a local MongoDB instance for development
+// MongoDB Connection with optimized timeouts for Atlas
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/ricemill';
-mongoose.connect(process.env.MONGODB_URI || MONGO_URI)
+mongoose.connect(process.env.MONGODB_URI || MONGO_URI, {
+  maxPoolSize: 10,
+  minPoolSize: 2,
+  socketTimeoutMS: 20000,
+  connectTimeoutMS: 15000,
+  serverSelectionTimeoutMS: 10000,
+  heartbeatFrequencyMS: 15000,
+  retryWrites: true,
+  retryReads: true,
+})
   .then(async () => {
     console.log('MongoDB connected');
     try {
@@ -116,7 +338,7 @@ mqttClient.on('connect', () => {
 
 // Throttle control for saving data (per device)
 const lastSaveTimes = new Map();
-const SAVE_INTERVAL = 60 * 700; // 1 minute
+const SAVE_INTERVAL = 60 * 1000; // 1 minute
 
 // Consecutive breach counters to prevent transient spikes
 // Key structure: `${userEmail}_${deviceId}_${alertType}`
@@ -171,7 +393,27 @@ mqttClient.on('message', async (topic, message) => {
         const newData = new MeterData(payload);
         await newData.save();
         lastSaveTimes.set(deviceId, now);
-        // console.log(`💾 Data saved to MongoDB for ${deviceId}: KW=${payload.KW?.toFixed(2)}, KVA=${payload.KVA?.toFixed(2)}, PF=${payload.PF?.toFixed(3)}, KWH=${payload.KWH}`);
+        // Clear historical cache so today's live data refreshes
+        histCache.clear();
+
+        // ── Fire-and-forget Firestore syncs (don't block MQTT processing) ──
+        const fsPayload = {
+          deviceId,
+          KWH: payload.KWH ?? null, KW: payload.KW ?? null,
+          KVA: payload.KVA ?? null, PF: payload.PF ?? null,
+          V1: payload.V1 ?? null, V2: payload.V2 ?? null, V3: payload.V3 ?? null,
+          I1: payload.I1 ?? null, I2: payload.I2 ?? null, I3: payload.I3 ?? null,
+          Freq: payload.Freq ?? null,
+        };
+        syncToFirestore('meterLatest', deviceId, {
+          ...fsPayload,
+          timestamp: admin.firestore.Timestamp.fromDate(new Date()),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        addToFirestore('meterHistory', {
+          ...fsPayload,
+          timestamp: admin.firestore.FieldValue.serverTimestamp()
+        });
       }
 
     // Emit data over WebSockets to specific device room
@@ -234,17 +476,29 @@ mqttClient.on('message', async (topic, message) => {
           const recentAlert = await Notification.findOne({
             type: alert.type,
             userEmail: user.email, // We should add userEmail to Notification model too
-            timestamp: { $gte: new Date(Date.now() - 5 * 60 * 700) }
+            timestamp: { $gte: new Date(Date.now() - 5 * 60 * 1000) }
           });
           
           if (!recentAlert) {
-            await new Notification({ 
+            const savedNotif = await new Notification({ 
               deviceId: payload.deviceId,
               title: `Limit Exceeded`, 
               message: alert.msg, 
               type: alert.type,
               userEmail: user.email.toLowerCase() 
             }).save();
+
+            // ── Sync notification to Firestore notificationHistory ───────────
+            syncToFirestore('notificationHistory', savedNotif._id.toString(), {
+              mongoId:   savedNotif._id.toString(),
+              deviceId:  payload.deviceId,
+              userEmail: user.email.toLowerCase(),
+              title:     'Limit Exceeded',
+              message:   alert.msg,
+              type:      alert.type,
+              read:      false,
+              timestamp: admin.firestore.FieldValue.serverTimestamp()
+            });
             
             // Send FCM push notifications to THIS user specifically
             try {
@@ -254,6 +508,10 @@ mqttClient.on('message', async (topic, message) => {
 
               if (registrationTokens.length > 0) {
                 const message = {
+                  notification: {
+                    title: `⚠️ Alert: ${payload.deviceId}`,
+                    body: alert.msg,
+                  },
                   data: {
                     title: `⚠️ Alert: ${payload.deviceId}`,
                     body: alert.msg,
@@ -263,6 +521,22 @@ mqttClient.on('message', async (topic, message) => {
                   tokens: registrationTokens,
                   android: {
                     priority: 'high',
+                    notification: {
+                      channelId: alert.type === 'PF' ? 'normal_alerts_v1' : 'threshold_alerts_v11_loud',
+                      sound: alert.type === 'PF' ? 'default' : 'alarm',
+                    }
+                  },
+                  apns: {
+                    payload: {
+                      aps: {
+                        alert: {
+                          title: `⚠️ Alert: ${payload.deviceId}`,
+                          body: alert.msg,
+                        },
+                        sound: alert.type === 'PF' ? 'default' : 'alarm.caf',
+                        badge: 1,
+                      },
+                    },
                   },
                 };
 
@@ -343,23 +617,37 @@ cron.schedule('0 0 * * *', async () => {
         const maxKW = await getDayExtreme('KW', -1);
         const minKW = await getDayExtreme('KW', 1, true);
 
+        const dailyDoc = {
+          totalKWh: consumedKWh,
+          maxKVA: maxKVA ? maxKVA.KVA : 0,
+          maxKVATime: maxKVA ? maxKVA.timestamp : null,
+          minKVA: minKVA ? minKVA.KVA : 0,
+          minKVATime: minKVA ? minKVA.timestamp : null,
+          maxKW: maxKW ? maxKW.KW : 0,
+          maxKWTime: maxKW ? maxKW.timestamp : null,
+          minKW: minKW ? minKW.KW : 0,
+          minKWTime: minKW ? minKW.timestamp : null,
+          avgPF: (stats.length > 0) ? (stats[0].avgPF || 0) : 0
+        };
+
         await DailyUsage.updateOne(
           { date: yesterday, deviceId },
-          { 
-            totalKWh: consumedKWh,
-            maxKVA: maxKVA ? maxKVA.KVA : 0,
-            maxKVATime: maxKVA ? maxKVA.timestamp : null,
-            minKVA: minKVA ? minKVA.KVA : 0,
-            minKVATime: minKVA ? minKVA.timestamp : null,
-            maxKW: maxKW ? maxKW.KW : 0,
-            maxKWTime: maxKW ? maxKW.timestamp : null,
-            minKW: minKW ? minKW.KW : 0,
-            minKWTime: minKW ? minKW.timestamp : null,
-            avgPF: (stats.length > 0) ? (stats[0].avgPF || 0) : 0
-          },
+          dailyDoc,
           { upsert: true }
         );
         console.log(`✅ Daily summary [${deviceId}] for ${yesterday.toDateString()} saved.`);
+
+        // ── Sync daily summary to Firestore dailyUsage ───────────────────────
+        const dateStr = yesterday.toISOString().split('T')[0]; // YYYY-MM-DD
+        syncToFirestore('dailyUsage', `${deviceId}_${dateStr}`, {
+          deviceId,
+          date:        dateStr,
+          ...dailyDoc,
+          syncedAt:    admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        // ── Compile and save hourly usage to Firestore hourlyUsage ───────────
+        await compileAndSaveHourlyTimeline(deviceId, dateStr);
       }
     }
 
@@ -367,8 +655,15 @@ cron.schedule('0 0 * * *', async () => {
     const cleanupDate = new Date();
     cleanupDate.setDate(cleanupDate.getDate() - 2);
     const resultMeter = await MeterData.deleteMany({ timestamp: { $lt: cleanupDate } });
-    const resultCond = await CondensedData.deleteMany({ timestamp: { $lt: cleanupDate } });
-    console.log(`🧹 Cleanup: Removed ${resultMeter.deletedCount} MeterData and ${resultCond.deletedCount} CondensedData records.`);
+    
+    let deletedCondCount = 0;
+    try {
+      const resultCond = await mongoose.connection.db.collection('condenseddatas').deleteMany({ timestamp: { $lt: cleanupDate } });
+      deletedCondCount = resultCond.deletedCount;
+    } catch (e) {
+      console.log('⚠️ Note: condenseddatas cleanup skipped or collection not found:', e.message);
+    }
+    console.log(`🧹 Cleanup: Removed ${resultMeter.deletedCount} MeterData and ${deletedCondCount} CondensedData records.`);
 
   } catch (err) {
     console.error('Error in cron job:', err);
@@ -537,6 +832,44 @@ app.post('/api/settings', verifyToken, async (req, res) => {
       { returnDocument: 'after', upsert: true }
     );
     // console.log(`✅ Settings updated for ${userEmail}:`, updates);
+
+    // Sync settings to all other users who share access to the current user's assigned devices
+    try {
+      const User = require('./models/User');
+      const currentUser = await User.findOne({ email: userEmail });
+      if (currentUser && currentUser.assignedDevices && currentUser.assignedDevices.length > 0) {
+        const cleanDevices = currentUser.assignedDevices.map(d => d.trim()).filter(d => d.length > 0);
+        if (cleanDevices.length > 0) {
+          const sharedUsers = await User.find({
+            email: { $ne: userEmail },
+            assignedDevices: { $in: cleanDevices }
+          });
+          if (sharedUsers.length > 0) {
+            const sharedEmails = sharedUsers.map(u => u.email.toLowerCase());
+            for (const email of sharedEmails) {
+              await UserSettings.findOneAndUpdate(
+                { userEmail: email },
+                { $set: updates },
+                { upsert: true }
+              );
+            }
+          }
+
+          // Broadcast settingsUpdated event to all device rooms this user has access to
+          for (const deviceId of cleanDevices) {
+            io.to(deviceId).emit('settingsUpdated', {
+              deviceId,
+              updates,
+              sender: userEmail
+            });
+            console.log(`📡 Broadcasted settingsUpdated event for device: ${deviceId}`);
+          }
+        }
+      }
+    } catch (syncErr) {
+      console.error('Failed to sync settings limits across shared users:', syncErr);
+    }
+
     res.json(settings);
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
@@ -555,6 +888,7 @@ app.delete('/api/notifications', verifyToken, async (req, res) => {
   try {
     const userEmail = req.user.email;
     await Notification.deleteMany({ userEmail });
+    await clearNotificationsFromFirestore(userEmail);
     res.json({ success: true });
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
@@ -563,7 +897,9 @@ app.delete('/api/notifications', verifyToken, async (req, res) => {
 app.delete('/api/notifications/:id', verifyToken, async (req, res) => {
   try {
     const userEmail = req.user.email;
-    await Notification.findOneAndDelete({ _id: req.params.id, userEmail });
+    const notifId = req.params.id;
+    await Notification.findOneAndDelete({ _id: notifId, userEmail });
+    await deleteFromFirestore('notificationHistory', notifId);
     res.json({ success: true });
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
@@ -612,6 +948,10 @@ app.post('/api/test-notification', async (req, res) => {
     if (!token) return res.status(400).json({ error: 'Token is required' });
 
     const payload = {
+      notification: {
+        title: title || 'Test Notification',
+        body: message || 'This is a test notification from the server',
+      },
       data: {
         title: title || 'Test Notification',
         body: message || 'This is a test notification from the server',
@@ -620,6 +960,22 @@ app.post('/api/test-notification', async (req, res) => {
       token: token,
       android: {
         priority: 'high',
+        notification: {
+          channelId: 'normal_alerts_v1',
+          sound: 'default',
+        }
+      },
+      apns: {
+        payload: {
+          aps: {
+            alert: {
+              title: title || 'Test Notification',
+              body: message || 'This is a test notification from the server',
+            },
+            sound: 'default',
+            badge: 1,
+          },
+        },
       },
     };
 
@@ -633,7 +989,7 @@ app.post('/api/test-notification', async (req, res) => {
 });
 
 // Get Daily Usage for total calculation (multi-device support)
-app.get('/api/daily-usage', async (req, res) => {
+app.get('/api/daily-usage', verifyToken, async (req, res) => {
   try {
     const { fromDate, deviceId } = req.query; 
     if (!fromDate || !deviceId) return res.status(400).json({ error: 'fromDate and deviceId are required' });
@@ -641,23 +997,48 @@ app.get('/api/daily-usage', async (req, res) => {
     const start = new Date(fromDate);
     start.setHours(0,0,0,0);
     
-    // 1. Get archived totals from start date (excluding today)
-    const usages = await DailyUsage.find({ 
-      deviceId, 
-      date: { $gte: start } 
-    }).lean();
+    const userEmail = req.user.email.toLowerCase();
+
+    // Check if there is a reset for this user/device that occurred on or after the queried fromDate
+    const latestReset = await DeviceReset.findOne({
+      deviceId,
+      userEmail,
+      resetAt: { $gte: start }
+    }).sort({ resetAt: -1 }).lean();
+
+    if (latestReset) {
+      // If there is a reset after/on the fromDate, the user has cleared the counter.
+      // So the consumed units since fromDate is the current latest reading minus the baseline at the reset.
+      const currentNow = await MeterData.findOne({ deviceId }).sort({ timestamp: -1 }).lean();
+      if (currentNow && currentNow.KWH) {
+        let consumption = currentNow.KWH - latestReset.kwhBaseline;
+        if (consumption < 0) consumption = currentNow.KWH;
+        return res.json({ totalKWhConsumed: consumption });
+      }
+      return res.json({ totalKWhConsumed: 0 });
+    }
+
+    // 1. Get archived totals from start date (excluding today) with Firestore self-healing
+    let usages = [];
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    yesterday.setHours(0,0,0,0);
+
+    if (start <= yesterday) {
+      usages = await getDailyUsagesWithSelfHealing(deviceId, start, yesterday);
+    }
     
     const archivedTotal = usages.reduce((sum, u) => sum + (u.totalKWh || 0), 0);
 
     // 2. Get live total for today
-    const liveToday = await calculateTodayConsumption(deviceId);
+    const liveToday = await calculateTodayConsumption(deviceId, userEmail);
 
     res.json({ totalKWhConsumed: archivedTotal + liveToday });
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
 // Helper to calculate live today usage
-async function calculateTodayConsumption(deviceId) {
+async function calculateTodayConsumption(deviceId, userEmail = null) {
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);
 
@@ -668,14 +1049,25 @@ async function calculateTodayConsumption(deviceId) {
     return 0;
   }
 
-  // 2. Get the baseline (last reading BEFORE today with a valid KWH > 0)
+  // 2. If userEmail is provided, check if user reset today
+  if (userEmail) {
+    const latestReset = await DeviceReset.findOne({ deviceId, userEmail: userEmail.toLowerCase() })
+      .sort({ resetAt: -1 })
+      .lean();
+    if (latestReset && latestReset.resetAt >= todayStart) {
+      const todayVal = currentNow.KWH - latestReset.kwhBaseline;
+      return todayVal < 0 ? 0 : todayVal;
+    }
+  }
+
+  // 3. Get the baseline (last reading BEFORE today with a valid KWH > 0)
   let baseline = await MeterData.findOne({ 
     deviceId, 
     timestamp: { $lt: todayStart },
     KWH: { $gt: 0 }
   }).sort({ timestamp: -1 }).lean();
 
-  // 3. Fallback: Earliest record from today with a valid KWH > 0
+  // 4. Fallback: Earliest record from today with a valid KWH > 0
   if (!baseline) {
     baseline = await MeterData.findOne({ 
       deviceId, 
@@ -703,13 +1095,210 @@ async function calculateTodayConsumption(deviceId) {
 }
 
 // Get Today's Consumption (Midnight to Now)
-app.get('/api/today-usage', async (req, res) => {
+app.get('/api/today-usage', verifyToken, async (req, res) => {
   try {
     const { deviceId } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId is required' });
 
-    const todayConsumption = await calculateTodayConsumption(deviceId);
+    const userEmail = req.user.email.toLowerCase();
+    const todayConsumption = await calculateTodayConsumption(deviceId, userEmail);
     res.json({ todayKWh: todayConsumption });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Reset Device Counter (user-specific KWH baseline)
+app.post('/api/device/reset', verifyToken, async (req, res) => {
+  try {
+    const { deviceId } = req.body;
+    const userEmail = req.user.email.toLowerCase();
+    
+    if (!deviceId) {
+      return res.status(400).json({ error: 'deviceId is required' });
+    }
+
+    // Find the latest MeterData reading for this device to establish baseline
+    const currentNow = await MeterData.findOne({ deviceId }).sort({ timestamp: -1 }).lean();
+    const baseline = currentNow ? (currentNow.KWH || 0) : 0;
+
+    // Calculate consumed units before this reset
+    const prevReset = await DeviceReset.findOne({ deviceId, userEmail }).sort({ resetAt: -1 }).lean();
+    let prevBaseline = 0;
+    if (prevReset) {
+      prevBaseline = prevReset.kwhBaseline;
+    } else {
+      // Find the earliest MeterData
+      const firstReading = await MeterData.findOne({ deviceId, KWH: { $gt: 0 } }).sort({ timestamp: 1 }).lean();
+      if (firstReading) {
+        prevBaseline = firstReading.KWH;
+      }
+    }
+    
+    let unitsBeforeReset = baseline - prevBaseline;
+    if (unitsBeforeReset < 0) {
+      unitsBeforeReset = baseline; // Roll over or meter replaced
+    }
+
+    const resetRecord = await DeviceReset.create({
+      deviceId,
+      userEmail,
+      resetAt: new Date(),
+      kwhBaseline: baseline,
+      unitsBeforeReset: unitsBeforeReset
+    });
+
+    // ── Sync reset record to Firestore deviceResets ──────────────────────────
+    syncToFirestore('deviceResets', resetRecord._id.toString(), {
+      mongoId:          resetRecord._id.toString(),
+      deviceId,
+      userEmail,
+      kwhBaseline:      baseline,
+      unitsBeforeReset: unitsBeforeReset,
+      resetAt:          admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    console.log(`🧹 Device reset logged for user ${userEmail} on device ${deviceId} (Baseline: ${baseline} kWh, Consumed: ${unitsBeforeReset} kWh)`);
+    res.json({ success: true, baseline, resetAt: resetRecord.resetAt, unitsBeforeReset });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get Device Resets History
+app.get('/api/device/resets', verifyToken, async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId is required' });
+
+    const userEmail = req.user.email.toLowerCase();
+    const resets = await DeviceReset.find({ deviceId, userEmail }).sort({ resetAt: -1 }).lean();
+    res.json(resets);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get Device Assignment Date
+app.get('/api/device/assignment', verifyToken, async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId is required' });
+
+    const userEmail = req.user.email.toLowerCase();
+
+    // Find the active assignment for this user and device
+    const assignment = await DeviceAssignment.findOne({
+      deviceId,
+      userEmail,
+      status: 'Active'
+    }).sort({ assignedAt: 1 }).lean();
+
+    if (assignment) {
+      return res.json({ assignedAt: assignment.assignedAt });
+    }
+    return res.json({ assignedAt: null });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// Get Detailed Day History grouped by hour (Digital Wellbeing style)
+app.get('/api/analysis/day-history', verifyToken, async (req, res) => {
+  try {
+    const { deviceId, date } = req.query; // date in format YYYY-MM-DD
+    if (!deviceId || !date) {
+      return res.status(400).json({ error: 'deviceId and date are required' });
+    }
+
+    const now = new Date();
+    const todayStr = now.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const isToday = todayStr === date;
+
+    // Check in-memory cache first (for historical dates)
+    if (!isToday) {
+      const cacheKey = `hourly_${deviceId}_${date}`;
+      const cached = hourlyCache.get(cacheKey);
+      if (cached) return res.json(cached);
+    }
+
+    if (!isToday && db) {
+      // Try to read pre-compiled data from Firestore
+      try {
+        const docRef = db.collection('hourlyUsage').doc(`${deviceId}_${date}`);
+        const docSnap = await docRef.get();
+        if (docSnap.exists) {
+          const docData = docSnap.data();
+          if (docData && docData.data) {
+            hourlyCache.set(`hourly_${deviceId}_${date}`, docData.data);
+            return res.json(docData.data);
+          }
+        }
+      } catch (fsErr) {
+        console.error('⚠️ Firestore hourlyUsage read error:', fsErr.message);
+      }
+    }
+
+    const start = new Date(`${date}T00:00:00+05:30`);
+    const end = new Date(`${date}T23:59:59.999+05:30`);
+
+    const hourlyStats = await MeterData.aggregate([
+      { $match: { deviceId, timestamp: { $gte: start, $lte: end } } },
+      {
+        $group: {
+          _id: { $hour: { date: "$timestamp", timezone: "+05:30" } },
+          avgKVA: { $avg: "$KVA" },
+          maxKVA: { $max: "$KVA" },
+          avgKW: { $avg: "$KW" },
+          maxKW: { $max: "$KW" },
+          avgPF: { $avg: "$PF" },
+          minKWH: { $min: "$KWH" },
+          maxKWH: { $max: "$KWH" }
+        }
+      },
+      { $sort: { "_id": 1 } }
+    ]);
+
+    const statsMap = new Map(hourlyStats.map(h => [h._id, h]));
+    const fullDay = [];
+
+    const currentHour = parseInt(now.toLocaleTimeString('en-US', { timeZone: 'Asia/Kolkata', hour12: false, hour: '2-digit' }));
+    const maxHourLimit = isToday ? currentHour : 23;
+
+    for (let hour = 0; hour <= maxHourLimit; hour++) {
+      const h = statsMap.get(hour);
+      let kwh = 0;
+      if (h) {
+        kwh = (h.maxKWH || 0) - (h.minKWH || 0);
+        if (kwh < 0) kwh = h.maxKWH || 0;
+      }
+      fullDay.push({
+        hour: hour,
+        kwh: kwh,
+        avgKVA: h ? (h.avgKVA || 0) : 0,
+        maxKVA: h ? (h.maxKVA || 0) : 0,
+        avgKW: h ? (h.avgKW || 0) : 0,
+        maxKW: h ? (h.maxKW || 0) : 0,
+        avgPF: h ? (h.avgPF || 0) : 0
+      });
+    }
+
+    // Cache the calculated historical fullDay to Firestore (fire-and-forget)
+    if (!isToday && fullDay.length > 0 && db) {
+      const hasData = fullDay.some(h => h.kwh > 0 || h.maxKVA > 0);
+      if (hasData) {
+        hourlyCache.set(`hourly_${deviceId}_${date}`, fullDay);
+        syncToFirestore('hourlyUsage', `${deviceId}_${date}`, {
+          deviceId,
+          date,
+          data: fullDay,
+          compiledAt: new Date()
+        }); // fire-and-forget, no await
+      }
+    }
+
+    res.json(fullDay);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -723,28 +1312,60 @@ app.get('/api/analysis/historical-usage', async (req, res) => {
     const { deviceId, days: daysCount = 7 } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId is required' });
 
-    const limit = Math.min(parseInt(daysCount), 60); // Cap at 60 days
+    const limit = Math.min(parseInt(daysCount), 60);
+    const cacheKey = `hist_${deviceId}_${limit}`;
+    const cached = histCache.get(cacheKey);
+    if (cached) return res.json(cached);
+
     const results = [];
     const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
     
+    // Batch-load all DailyUsage records with self-healing
+    const rangeStart = new Date();
+    rangeStart.setDate(rangeStart.getDate() - (limit - 1));
+    rangeStart.setHours(0, 0, 0, 0);
+
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    yesterday.setHours(0, 0, 0, 0);
+
+    let usages = [];
+    if (rangeStart <= yesterday) {
+      usages = await getDailyUsagesWithSelfHealing(deviceId, rangeStart, yesterday);
+    }
+    const recordMap = new Map(usages.map(r => [r.date.toISOString().split('T')[0], r]));
+
     for (let i = limit - 1; i >= 0; i--) {
       const targetDate = new Date();
       targetDate.setDate(targetDate.getDate() - i);
       targetDate.setHours(0, 0, 0, 0);
+      const dateStr = targetDate.toISOString().split('T')[0];
 
       let kwh = 0;
       if (i === 0) {
-        // Today is live
         kwh = await calculateTodayConsumption(deviceId);
       } else {
-        // Historical
-        const record = await DailyUsage.findOne({ deviceId, date: targetDate });
+        const record = recordMap.get(dateStr);
         if (record) {
           kwh = record.totalKWh;
         } else {
           // Fallback: If summary is missing but data is recent (within 2 days), calculate it
           const fallback = await calculateHistoricalDayStats(deviceId, targetDate);
-          kwh = fallback ? fallback.totalKWh : 0;
+          if (fallback) {
+            kwh = fallback.totalKWh;
+            await DailyUsage.updateOne({ date: targetDate, deviceId }, fallback, { upsert: true });
+            if (db) {
+              const dateStr = targetDate.toISOString().split('T')[0];
+              syncToFirestore('dailyUsage', `${deviceId}_${dateStr}`, {
+                deviceId,
+                date: dateStr,
+                ...fallback,
+                syncedAt: admin.firestore.FieldValue.serverTimestamp()
+              });
+            }
+          } else {
+            kwh = 0;
+          }
         }
       }
 
@@ -758,6 +1379,7 @@ app.get('/api/analysis/historical-usage', async (req, res) => {
       }
     }
 
+    histCache.set(cacheKey, results);
     res.json(results);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -777,28 +1399,47 @@ app.get('/api/analysis/period-stats', async (req, res) => {
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0);
 
-    // 1. Get History from DailyUsage (up to yesterday)
-    let historicalUsages = await DailyUsage.find({
-      deviceId,
-      date: { $gte: start, $lt: todayStart }
-    }).lean();
+    // 1. Get History from DailyUsage (up to yesterday/end date) with Firestore self-healing
+    const historyEnd = end < todayStart ? end : new Date(todayStart - 1);
+    historyEnd.setHours(0, 0, 0, 0);
+    let historicalUsages = [];
+    if (start < todayStart) {
+      const normStart = new Date(start);
+      normStart.setHours(0, 0, 0, 0);
+      historicalUsages = await getDailyUsagesWithSelfHealing(deviceId, normStart, historyEnd);
+    }
 
-    // 1.1 Fallback logic: If we are looking for a specific day (like yesterday) 
-    // and it's missing from DailyUsage, calculate it from raw data.
-    if (historicalUsages.length === 0 && start < todayStart) {
-      // Calculate how many days we are looking for
-      const dayDiff = Math.ceil((todayStart - start) / (700 * 60 * 60 * 24));
-      
-      // If it's a small range (last 2 days), we can afford to calculate it live
-      if (dayDiff <= 2) {
-        const fallbackData = [];
+    // 1.1 Fallback logic: If any historical day summaries are missing, calculate them live
+    if (start < todayStart) {
+      const normStart = new Date(start);
+      normStart.setHours(0, 0, 0, 0);
+      const normHistoryEnd = new Date(historyEnd);
+      normHistoryEnd.setHours(0, 0, 0, 0);
+      const dayDiff = Math.round((normHistoryEnd - normStart) / (1000 * 60 * 60 * 24)) + 1;
+
+      if (dayDiff > 0 && dayDiff <= 3) {
+        const historicalMap = new Map(historicalUsages.map(u => [new Date(u.date).setHours(0, 0, 0, 0), u]));
         for (let i = 0; i < dayDiff; i++) {
-          const d = new Date(start);
+          const d = new Date(normStart);
           d.setDate(d.getDate() + i);
-          const stats = await calculateHistoricalDayStats(deviceId, d);
-          if (stats) fallbackData.push(stats);
+          const dMidnight = d.getTime();
+          if (!historicalMap.has(dMidnight)) {
+            const stats = await calculateHistoricalDayStats(deviceId, d);
+            if (stats) {
+              historicalUsages.push(stats);
+              await DailyUsage.updateOne({ date: d, deviceId }, stats, { upsert: true });
+              if (db) {
+                const dateStr = d.toISOString().split('T')[0];
+                syncToFirestore('dailyUsage', `${deviceId}_${dateStr}`, {
+                  deviceId,
+                  date: dateStr,
+                  ...stats,
+                  syncedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+              }
+            }
+          }
         }
-        historicalUsages = fallbackData;
       }
     }
 
@@ -957,24 +1598,43 @@ app.get('/api/analysis/range-usage', async (req, res) => {
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0);
 
-    // 1. Get archived totals for the range
-    let usages = await DailyUsage.find({
-      deviceId,
-      date: { $gte: start, $lte: end }
-    }).lean();
+    // 1. Get archived totals for the range (excluding today) with Firestore self-healing
+    const historyEnd = end < todayStart ? end : new Date(todayStart - 1);
+    historyEnd.setHours(0, 0, 0, 0);
+    let usages = [];
+    if (start < todayStart) {
+      const normStart = new Date(start);
+      normStart.setHours(0, 0, 0, 0);
+      usages = await getDailyUsagesWithSelfHealing(deviceId, normStart, historyEnd);
 
-    // 1.1 Fallback: If no summaries found but range is recent, calculate consumption live
-    if (usages.length === 0 && end < todayStart) {
-      const dayDiff = Math.ceil((end - start) / (700 * 60 * 60 * 24)) + 1;
-      if (dayDiff <= 3) {
-        const fallbackData = [];
+      // 1.1 Fallback: If any summaries are missing in the range, calculate live
+      const normHistoryEnd = new Date(historyEnd);
+      normHistoryEnd.setHours(0, 0, 0, 0);
+      const dayDiff = Math.round((normHistoryEnd - normStart) / (1000 * 60 * 60 * 24)) + 1;
+
+      if (dayDiff > 0 && dayDiff <= 3) {
+        const usagesMap = new Map(usages.map(u => [new Date(u.date).setHours(0, 0, 0, 0), u]));
         for (let i = 0; i < dayDiff; i++) {
-          const d = new Date(start);
+          const d = new Date(normStart);
           d.setDate(d.getDate() + i);
-          const stats = await calculateHistoricalDayStats(deviceId, d);
-          if (stats) fallbackData.push(stats);
+          const dMidnight = d.getTime();
+          if (!usagesMap.has(dMidnight)) {
+            const stats = await calculateHistoricalDayStats(deviceId, d);
+            if (stats) {
+              usages.push(stats);
+              await DailyUsage.updateOne({ date: d, deviceId }, stats, { upsert: true });
+              if (db) {
+                const dateStr = d.toISOString().split('T')[0];
+                syncToFirestore('dailyUsage', `${deviceId}_${dateStr}`, {
+                  deviceId,
+                  date: dateStr,
+                  ...stats,
+                  syncedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+              }
+            }
+          }
         }
-        usages = fallbackData;
       }
     }
 
@@ -996,6 +1656,49 @@ app.get('/api/analysis/monthly-usage', async (req, res) => {
   try {
     const { deviceId } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId is required' });
+
+    // Sync all historical records from Firestore if local collection is empty (cold start / cache drop)
+    if (db) {
+      try {
+        const localCount = await DailyUsage.countDocuments({ deviceId });
+        if (localCount === 0) {
+          console.log(`🔍 [Self-Healing] Local DailyUsage is empty for ${deviceId}. Restoring from Firestore...`);
+          const snapshot = await db.collection('dailyUsage')
+            .where('deviceId', '==', deviceId)
+            .get();
+          if (!snapshot.empty) {
+            const bulkOps = snapshot.docs.map(doc => {
+              const data = doc.data();
+              const dateStr = data.date;
+              const dailyDoc = {
+                totalKWh: data.totalKWh,
+                maxKVA: data.maxKVA || 0,
+                maxKVATime: fsToDate(data.maxKVATime),
+                minKVA: data.minKVA || 0,
+                minKVATime: fsToDate(data.minKVATime),
+                maxKW: data.maxKW || 0,
+                maxKWTime: fsToDate(data.maxKWTime),
+                minKW: data.minKW || 0,
+                minKWTime: fsToDate(data.minKWTime),
+                avgPF: data.avgPF || 0
+              };
+              const targetDate = new Date(`${dateStr}T00:00:00+05:30`);
+              return {
+                updateOne: {
+                  filter: { date: targetDate, deviceId },
+                  update: { $set: dailyDoc },
+                  upsert: true
+                }
+              };
+            });
+            await DailyUsage.bulkWrite(bulkOps);
+            console.log(`✅ [Self-Healing] Bulk-restored ${bulkOps.length} DailyUsage records from Firestore inside monthly-usage.`);
+          }
+        }
+      } catch (err) {
+        console.error('⚠️ [Self-Healing] Error self-healing monthly-usage:', err.message);
+      }
+    }
 
     const monthlyData = await DailyUsage.aggregate([
       { $match: { deviceId } },

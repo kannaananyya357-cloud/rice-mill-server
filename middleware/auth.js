@@ -11,6 +11,9 @@ const verifyToken = async (req, res, next) => {
 
   try {
     const decodedToken = await admin.auth().verifyIdToken(token);
+    if (decodedToken.email) {
+      decodedToken.email = decodedToken.email.toLowerCase();
+    }
     req.user = decodedToken; // contains uid, email, etc.
 
     // Fetch full user from DB if needed
