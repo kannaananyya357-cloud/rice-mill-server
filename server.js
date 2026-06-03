@@ -1100,6 +1100,65 @@ async function calculateTodayConsumption(deviceId, userEmail = null) {
   return todayConsumption;
 }
 
+// Helper to calculate live today kvah usage
+async function calculateTodayKvahConsumption(deviceId, userEmail = null) {
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+
+  // 1. Get the current latest reading
+  const currentNow = await MeterData.findOne({ deviceId }).sort({ timestamp: -1 }).lean();
+  if (!currentNow || !currentNow.KVAH) {
+    return 0;
+  }
+
+  // 2. If userEmail is provided, check if user reset today
+  if (userEmail) {
+    const latestReset = await DeviceReset.findOne({ deviceId, userEmail: userEmail.toLowerCase() })
+      .sort({ resetAt: -1 })
+      .lean();
+    if (latestReset && latestReset.resetAt >= todayStart) {
+      const resetMeterData = await MeterData.findOne({
+        deviceId,
+        timestamp: { $lte: latestReset.resetAt }
+      }).sort({ timestamp: -1 }).lean();
+      if (resetMeterData && resetMeterData.KVAH) {
+        const todayVal = currentNow.KVAH - resetMeterData.KVAH;
+        return todayVal < 0 ? 0 : todayVal;
+      }
+    }
+  }
+
+  // 3. Get the baseline (last reading BEFORE today with a valid KVAH > 0)
+  let baseline = await MeterData.findOne({ 
+    deviceId, 
+    timestamp: { $lt: todayStart },
+    KVAH: { $gt: 0 }
+  }).sort({ timestamp: -1 }).lean();
+
+  // 4. Fallback: Earliest record from today with a valid KVAH > 0
+  if (!baseline) {
+    baseline = await MeterData.findOne({ 
+      deviceId, 
+      timestamp: { $gte: todayStart },
+      KVAH: { $gt: 0 }
+    }).sort({ timestamp: 1 }).lean();
+  }
+
+  let todayConsumption = 0;
+  if (baseline && baseline.KVAH && currentNow && currentNow.KVAH) {
+    if (currentNow.KVAH >= baseline.KVAH) {
+      todayConsumption = currentNow.KVAH - baseline.KVAH;
+    } else {
+      // Rollover: Meter reset or wrapped around
+      todayConsumption = currentNow.KVAH;
+    }
+  } else {
+    todayConsumption = 0;
+  }
+  
+  return todayConsumption;
+}
+
 // Get Today's Consumption (Midnight to Now)
 app.get('/api/today-usage', verifyToken, async (req, res) => {
   try {
@@ -1107,8 +1166,9 @@ app.get('/api/today-usage', verifyToken, async (req, res) => {
     if (!deviceId) return res.status(400).json({ error: 'deviceId is required' });
 
     const userEmail = req.user.email.toLowerCase();
-    const todayConsumption = await calculateTodayConsumption(deviceId, userEmail);
-    res.json({ todayKWh: todayConsumption });
+    const todayKWh = await calculateTodayConsumption(deviceId, userEmail);
+    const todayKVAh = await calculateTodayKvahConsumption(deviceId, userEmail);
+    res.json({ todayKWh, todayKVAh });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
