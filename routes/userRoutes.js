@@ -3,6 +3,8 @@ const router = express.Router();
 const User = require('../models/User');
 const DeviceToken = require('../models/DeviceToken');
 const UserSettings = require('../models/UserSettings');
+const DeviceAssignment = require('../models/DeviceAssignment');
+const RegistrationRequest = require('../models/RegistrationRequest');
 const admin = require('firebase-admin');
 const { verifyToken, requireAdmin } = require('../middleware/auth');
 
@@ -38,8 +40,9 @@ router.post('/sync', verifyToken, async (req, res) => {
         console.log(`👤 New Guest user registered: ${email}`);
       }
     } else {
-      // Update UID if it was pre-registered by email
-      if (user.uid === user.email) {
+      // Update UID if it was pre-registered by email or if the Firebase UID has changed
+      if (user.uid !== uid) {
+        console.log(`🔄 Updating UID for ${email} from ${user.uid} to ${uid}`);
         user.uid = uid;
         await user.save();
       }
@@ -123,7 +126,22 @@ router.post('/register', async (req, res) => {
     
     let user = await User.findOne({ email: normalizedEmail });
     if (user) {
-      return res.status(400).json({ message: 'A user with this email already exists in the system.' });
+      if (user.role === 'Guest') {
+        user.name = name;
+        user.phone = phone;
+        user.millName = millName || '';
+        user.role = 'User';
+        if (deviceId && !user.assignedDevices.includes(deviceId)) {
+          user.assignedDevices.push(deviceId);
+        }
+        await user.save();
+        // Auto-delete any pending registration request for this email
+        RegistrationRequest.deleteOne({ email: normalizedEmail }).catch(() => {});
+        const updatedUser = await getHierarchicalUser(normalizedEmail);
+        return res.status(200).json({ message: 'User upgraded from Guest successfully', user: updatedUser });
+      } else {
+        return res.status(400).json({ message: 'A user with this email already exists in the system.' });
+      }
     }
 
     user = new User({
@@ -136,6 +154,8 @@ router.post('/register', async (req, res) => {
       assignedDevices: deviceId ? [deviceId] : []
     });
     await user.save();
+    // Auto-delete any pending registration request for this email
+    RegistrationRequest.deleteOne({ email: normalizedEmail }).catch(() => {});
     
     const updatedUser = await getHierarchicalUser(normalizedEmail);
     res.status(201).json({ message: 'User registered successfully', user: updatedUser });
@@ -144,28 +164,127 @@ router.post('/register', async (req, res) => {
   }
 });
 
+// POST /requests: Submit a registration request
+router.post('/requests', async (req, res) => {
+  try {
+    const { name, email, phone, millName } = req.body;
+    if (!name || !email || !phone || !millName) {
+      return res.status(400).json({ error: 'All fields (name, email, phone, millName) are required.' });
+    }
+    
+    const existingUser = await User.findOne({ email: email.toLowerCase() });
+    if (existingUser && existingUser.role !== 'Guest') {
+      return res.status(400).json({ error: 'A user with this email is already registered.' });
+    }
+
+    let request = await RegistrationRequest.findOne({ email: email.toLowerCase() });
+    if (request) {
+      if (request.status === 'Pending') {
+        return res.status(400).json({ error: 'You have already submitted a registration request. It is pending approval.' });
+      } else {
+        request.name = name;
+        request.phone = phone;
+        request.millName = millName;
+        request.status = 'Pending';
+        await request.save();
+        return res.status(200).json({ message: 'Registration request resubmitted successfully.', request });
+      }
+    }
+
+    request = new RegistrationRequest({
+      name,
+      email: email.toLowerCase(),
+      phone,
+      millName,
+      status: 'Pending'
+    });
+    await request.save();
+
+    res.status(201).json({ message: 'Registration request submitted successfully.', request });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /requests: Retrieve all registration requests
+router.get('/requests', async (req, res) => {
+  try {
+    const requests = await RegistrationRequest.find().sort({ createdAt: -1 });
+    res.json(requests);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /requests/:id: Remove/Reject/Delete a registration request (idempotent)
+router.delete('/requests/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await RegistrationRequest.findByIdAndDelete(id);
+    // Idempotent: always return success even if already deleted
+    res.json({ message: 'Registration request deleted successfully.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /device-history: Query the DeviceAssignment collection to return a list of assignments (Active & Revoked)
+router.get('/device-history', async (req, res) => {
+  try {
+    const history = await DeviceAssignment.find().sort({ assignedAt: -1 });
+    res.json(history);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /device-history/:id: Delete a specific device assignment history log entry
+router.delete('/device-history/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const assignment = await DeviceAssignment.findByIdAndDelete(id);
+    if (!assignment) {
+      return res.status(404).json({ error: 'Device assignment log not found.' });
+    }
+    
+    try {
+      if (admin.apps.length > 0) {
+        await admin.firestore()
+          .collection('deviceAssignments')
+          .doc(id)
+          .delete();
+      }
+    } catch (fsErr) {
+      console.error('Firestore assignment deletion sync error:', fsErr.message);
+    }
+    
+    res.json({ message: 'Device assignment log deleted successfully.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Admin Route: Get hierarchical user data (Owners and their Shared Users)
 router.get('/', async (req, res) => {
   try {
-    // Self-healing: Ensure any user with a populated mainUserEmail has isSharedUser set to true
-    await User.updateMany(
+    // Self-healing (async, non-blocking): Ensure any user with mainUserEmail has isSharedUser=true
+    User.updateMany(
       { mainUserEmail: { $exists: true, $ne: null, $ne: "" }, isSharedUser: { $ne: true } },
       { $set: { isSharedUser: true } }
-    );
+    ).catch(err => console.error('Self-healing updateMany failed:', err.message));
 
-    // 1. Fetch all users
-    const allUsers = await User.find();
+    // 1. Fetch all users in a single query
+    const allUsers = await User.find().lean();
     
-    // 2. Separate into Owners and Shared Users
+    // 2. Separate into Owners and Shared Users (in-memory)
     // An owner is anyone who is NOT a shared user and has at least one device (or is an Admin)
     const owners = allUsers.filter(u => !u.isSharedUser && u.role !== 'Guest');
     const sharedUsers = allUsers.filter(u => u.isSharedUser);
 
-    // 3. Nest Shared Users under their respective Owners
+    // 3. Nest Shared Users under their respective Owners (in-memory)
     const hierarchicalData = owners.map(owner => {
-      const ownerObj = owner.toObject();
-      ownerObj.subUsers = sharedUsers.filter(u => u.mainUserEmail === owner.email);
-      return ownerObj;
+      owner.subUsers = sharedUsers.filter(u => u.mainUserEmail === owner.email);
+      return owner;
     });
 
     res.json(hierarchicalData);
@@ -696,8 +815,5 @@ router.get('/:email/shared-details', verifyToken, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-
-
 
 module.exports = router;

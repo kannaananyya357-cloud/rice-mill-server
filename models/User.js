@@ -25,7 +25,7 @@ const userSchema = new mongoose.Schema({
 
 userSchema.post('save', async function(doc) {
   try {
-    const DeviceAssignment = mongoose.model('DeviceAssignment');
+    const DeviceAssignment = require('./DeviceAssignment');
     const admin = require('firebase-admin');
     const userEmail = doc.email.toLowerCase();
     
